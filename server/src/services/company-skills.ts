@@ -1630,12 +1630,24 @@ async function readUrlSkillImports(
           slug,
         ),
       };
+      // `path.posix.dirname("SKILL.md")` is ".", which is what happens whenever the
+      // import URL already points at the skill directory itself
+      // (https://host/owner/repo/tree/<ref>/review). Using "." as a path prefix
+      // produces "./", which matches nothing, so the inventory collapsed to SKILL.md
+      // alone and every sibling the skill reads at runtime went silently missing.
+      //
+      // Only widen to siblings when basePrefix actually narrowed the tree to one
+      // skill. A bare repo-root SKILL.md also yields skillDir "." but has no such
+      // narrowing, and there the "siblings" are the entire repository — so it keeps
+      // the SKILL.md-only inventory rather than swallowing every file in the repo.
+      const collectsSiblings = skillDir !== "." || basePrefix !== "";
+      const siblingPrefix = skillDir === "." ? "" : `${skillDir}/`;
       const inventory = filteredPaths
-        .filter((entry) => entry === relativeSkillPath || entry.startsWith(`${skillDir}/`))
-        .map((entry) => ({
-          path: entry === relativeSkillPath ? "SKILL.md" : entry.slice(skillDir.length + 1),
-          kind: classifyInventoryKind(entry === relativeSkillPath ? "SKILL.md" : entry.slice(skillDir.length + 1)),
-        }))
+        .filter((entry) => entry === relativeSkillPath || (collectsSiblings && entry.startsWith(siblingPrefix)))
+        .map((entry) => {
+          const inventoryPath = entry === relativeSkillPath ? "SKILL.md" : entry.slice(siblingPrefix.length);
+          return { path: inventoryPath, kind: classifyInventoryKind(inventoryPath) };
+        })
         .sort((left, right) => left.path.localeCompare(right.path));
       skills.push({
         key: deriveCanonicalSkillKey(companyId, {
