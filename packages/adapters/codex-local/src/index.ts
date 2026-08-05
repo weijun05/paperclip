@@ -16,6 +16,11 @@ export const CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS = [
   "gpt-5.6-luna",
   "gpt-5.5",
   "gpt-5.4",
+  // Advertising a slug in `models` makes it a known model, and known models only get
+  // fast mode from this list. gpt-5.3-codex-spark was previously reachable only as a
+  // manual model, where fast mode is permitted by default — keep that behaviour rather
+  // than silently disabling it for anyone already configured with the slug.
+  "gpt-5.3-codex-spark",
 ] as const;
 
 function normalizeModelId(model: string | null | undefined): string {
@@ -63,6 +68,7 @@ export const models = [
   { id: DEFAULT_CODEX_LOCAL_MODEL, label: DEFAULT_CODEX_LOCAL_MODEL },
   { id: "gpt-5.6-terra", label: "gpt-5.6-terra" },
   { id: "gpt-5.6-luna", label: "gpt-5.6-luna" },
+  { id: "gpt-5.3-codex-spark", label: "gpt-5.3-codex-spark" },
   { id: "gpt-5.4", label: "gpt-5.4" },
   { id: "gpt-5.4-mini", label: "gpt-5.4-mini" },
   { id: "gpt-5", label: "gpt-5" },

@@ -21,7 +21,11 @@ describe("codex local adapter metadata", () => {
     expect(modelIds).not.toContain("gpt-5.6");
     expect(isCodexLocalFastModeSupported(DEFAULT_CODEX_LOCAL_MODEL)).toBe(true);
     expect(modelIds).not.toContain("gpt-5.3-codex");
-    expect(modelIds).not.toContain("gpt-5.3-codex-spark");
+    // gpt-5.3-codex-spark is advertised: Codex ships it and it was previously reachable
+    // only by typing the slug manually. Fast mode must stay available for it, which for a
+    // known model means membership of CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS.
+    expect(modelIds).toContain("gpt-5.3-codex-spark");
+    expect(isCodexLocalFastModeSupported("gpt-5.3-codex-spark")).toBe(true);
   });
 
   it("normalizes the legacy bare gpt-5.6 alias to the concrete gpt-5.6-sol slug", () => {
