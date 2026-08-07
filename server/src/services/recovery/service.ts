@@ -79,8 +79,18 @@ import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js"
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
-export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
-export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
+// Calibrated against observed codex_local transport stalls rather than round
+// numbers. Two real cases from the same adapter:
+//   - a WebSocket->HTTPS fallback that self-recovered after a ~38m silence
+//   - a run that went silent for 116m and never recovered, but was never
+//     surfaced because the old 4h critical threshold had not elapsed
+// 20m surfaces the self-recovering case as "suspicious" (informative, and it
+// clears on its own), while 1h reaches "critical" for a genuine hang roughly
+// four times sooner than before. The adapter-level inactivity monitor is
+// supposed to catch this first, but has been observed not to fire, so this is
+// the backstop that actually runs.
+export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 20 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
