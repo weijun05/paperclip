@@ -1131,9 +1131,11 @@ function buildCodexStartupConfig(input: {
   requestedModel: string;
   requestedThinkingEffort: string;
   fastMode: boolean;
+  playwrightSocketsDir: string;
 }): { value: string | null; invalidExistingConfig: boolean } {
+  const playwrightSocketsDir = input.playwrightSocketsDir.trim();
   const hasRuntimeConfig = Boolean(
-    input.requestedModel || input.requestedThinkingEffort || input.fastMode,
+    input.requestedModel || input.requestedThinkingEffort || input.fastMode || playwrightSocketsDir,
   );
   if (!hasRuntimeConfig) return { value: null, invalidExistingConfig: false };
 
@@ -1148,6 +1150,10 @@ function buildCodexStartupConfig(input: {
     }
   }
 
+  const existingMcpServers = parseObject(existing.mcp_servers);
+  const existingPlaywright = parseObject(existingMcpServers.playwright);
+  const existingPlaywrightEnv = parseObject(existingPlaywright.env);
+
   return {
     value: JSON.stringify({
       ...existing,
@@ -1161,6 +1167,20 @@ function buildCodexStartupConfig(input: {
             features: {
               ...parseObject(existing.features),
               fast_mode: true,
+            },
+          }
+        : {}),
+      ...(playwrightSocketsDir
+        ? {
+            mcp_servers: {
+              ...existingMcpServers,
+              playwright: {
+                ...existingPlaywright,
+                env: {
+                  ...existingPlaywrightEnv,
+                  PWTEST_SOCKETS_DIR: playwrightSocketsDir,
+                },
+              },
             },
           }
         : {}),
@@ -1590,6 +1610,7 @@ async function buildRuntime(input: {
       requestedModel,
       requestedThinkingEffort,
       fastMode,
+      playwrightSocketsDir: env.PWTEST_SOCKETS_DIR ?? "",
     });
     if (codexStartupConfig.invalidExistingConfig) {
       await input.ctx.onLog(
