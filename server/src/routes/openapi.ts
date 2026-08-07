@@ -26,6 +26,7 @@ import {
   // Issue
   createIssueSchema,
   updateIssueSchema,
+  stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
   checkoutIssueSchema,
@@ -47,6 +48,17 @@ import {
   updateCompanyBrandingSchema,
   companyArtifactsQuerySchema,
   companyArtifactsResponseSchema,
+  // Decisions
+  addDecisionQueueItemSchema,
+  createDecisionQueueSchema,
+  createDecisionArchiveProposalSchema,
+  decisionAttentionSourceKindSchema,
+  decisionInputsSchema,
+  decisionOptionsSchema,
+  removeDecisionQueueItemSchema,
+  updateDecisionQueueSchema,
+  updateDecisionTriageSchema,
+  updateDecisionRetentionSchema,
   // Routine
   createRoutineSchema,
   updateRoutineSchema,
@@ -108,6 +120,8 @@ import {
   companySkillFileDeleteSchema,
   companySkillFileUpdateSchema,
   companySkillImportSchema,
+  companySkillProjectBrowseRequestSchema,
+  companySkillProjectBrowseResultSchema,
   companySkillProjectScanRequestSchema,
   companySkillProjectScanResultSchema,
   companySkillRenameResultSchema,
@@ -132,6 +146,7 @@ import {
   rejectIssueThreadInteractionSchema,
   respondIssueThreadInteractionSchema,
   submitIssueThreadInteractionVerdictsSchema,
+  withdrawIssueThreadInteractionSchema,
   // Auth / profile
   updateCurrentUserProfileSchema,
   // Company portability (legacy routes)
@@ -167,7 +182,6 @@ import {
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
   cancelIssueThreadInteractionSchema,
-  withdrawIssueThreadInteractionSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
@@ -745,6 +759,7 @@ const BOARD_ONLY_PREFIXES = [
 ];
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "GET /api/cloud/stacks",
   "GET /api/companies",
   "POST /api/companies",
   "GET /api/companies/stats",
@@ -803,6 +818,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/accept",
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
+  "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
   "GET /api/companies/{companyId}/tools/gallery",
   "POST /api/companies/{companyId}/tools/apps/connect",
   "POST /api/companies/{companyId}/tools/apps/{connectionId}/finish",
@@ -1054,6 +1070,39 @@ function applyDocumentFixups(document: any): any {
 
 // ─── Health ──────────────────────────────────────────────────────────────────
 
+// Shared by the healthy and database-unreachable responses: full details
+// (including serverInfo) ride only on board/agent-actor responses.
+const healthServerInfoSchema = z.object({
+  processStartedAt: z.string().datetime(),
+  git: z.union([
+    z.object({
+      available: z.literal(true),
+      fullSha: z.string(),
+      shortSha: z.string(),
+      branchName: z.string().nullable(),
+      subject: z.string(),
+      committedAt: z.string().datetime().nullable(),
+      localChanges: z.union([
+        z.object({
+          available: z.literal(true),
+          hasLocalChanges: z.boolean(),
+          stagedFileCount: z.number().int().nonnegative(),
+          unstagedFileCount: z.number().int().nonnegative(),
+          untrackedFileCount: z.number().int().nonnegative(),
+        }).strict(),
+        z.object({
+          available: z.literal(false),
+          unavailableReason: z.enum(["git_status_unavailable"]),
+        }).strict(),
+      ]),
+    }).strict(),
+    z.object({
+      available: z.literal(false),
+      unavailableReason: z.enum(["git_unavailable", "invalid_git_metadata"]),
+    }).strict(),
+  ]),
+}).strict();
+
 registry.registerPath({
   method: "get",
   path: "/api/health",
@@ -1063,7 +1112,17 @@ registry.registerPath({
     200: r.ok(z.object({
       status: z.enum(["ok", "unhealthy"]),
       version: z.string().optional(),
+      // Running build commit (full git SHA), or null when git metadata is
+      // unavailable. Present on every response shape, including redacted ones.
+      commit: z.string().nullable(),
       deploymentMode: z.string().optional(),
+      cloud: z.object({
+        managed: z.literal(true),
+        managedBy: z.literal("paperclip-cloud"),
+        stackSlug: z.string().nullable(),
+        stackDisplayName: z.string().optional(),
+        cloudBaseUrl: z.string().nullable(),
+      }).strict().optional(),
       bootstrapStatus: z.enum(["ready", "bootstrap_pending"]).optional(),
       bootstrapInviteActive: z.boolean().optional(),
       databaseBackup: z.object({
@@ -1097,38 +1156,26 @@ registry.registerPath({
         code: z.string(),
         message: z.string(),
       })).optional(),
-      serverInfo: z.object({
-        processStartedAt: z.string().datetime(),
-        git: z.union([
-          z.object({
-            available: z.literal(true),
-            fullSha: z.string(),
-            shortSha: z.string(),
-            branchName: z.string().nullable(),
-            subject: z.string(),
-            committedAt: z.string().datetime().nullable(),
-            localChanges: z.union([
-              z.object({
-                available: z.literal(true),
-                hasLocalChanges: z.boolean(),
-                stagedFileCount: z.number().int().nonnegative(),
-                unstagedFileCount: z.number().int().nonnegative(),
-                untrackedFileCount: z.number().int().nonnegative(),
-              }).strict(),
-              z.object({
-                available: z.literal(false),
-                unavailableReason: z.enum(["git_status_unavailable"]),
-              }).strict(),
-            ]),
-          }).strict(),
-          z.object({
-            available: z.literal(false),
-            unavailableReason: z.enum(["git_unavailable", "invalid_git_metadata"]),
-          }).strict(),
-        ]),
-      }).strict().optional(),
+      serverInfo: healthServerInfoSchema.optional(),
     })),
-    503: { description: "Service unavailable", content: { "application/json": { schema: ErrorSchema } } },
+    // The database-unreachable body still carries version and commit so
+    // deployment tooling can verify the running build during an outage;
+    // serverInfo rides only on full-details (board/agent) responses.
+    503: {
+      description: "Service unavailable",
+      content: {
+        "application/json": {
+          schema: z.object({
+            status: z.literal("unhealthy"),
+            version: z.string(),
+            serverVersion: z.string(),
+            commit: z.string().nullable(),
+            error: z.literal("database_unreachable"),
+            serverInfo: healthServerInfoSchema.optional(),
+          }),
+        },
+      },
+    },
   },
 });
 
@@ -1141,6 +1188,21 @@ registry.registerPath({
 });
 
 // ─── Companies ───────────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/cloud/stacks",
+  tags: ["cloud"],
+  summary: "List the current Cloud tenant user's stacks",
+  responses: {
+    200: r.ok(),
+    403: r.forbidden,
+    404: r.notFound,
+    502: r.serverError,
+    503: r.serverError,
+    500: r.serverError,
+  },
+});
 
 registry.registerPath({
   method: "get",
@@ -1621,6 +1683,61 @@ const AgentSecretListResponseSchema = z.object({
   })),
 });
 
+const createAgentSecretProposalSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("secret"),
+    name: z.string().min(1),
+    description: z.string().optional().nullable(),
+    value: z.string().min(1),
+    justification: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal("binding"),
+    secretId: z.string().uuid().optional(),
+    secretProposalId: z.string().uuid().optional(),
+    targetAgentId: z.string().uuid().optional(),
+    configPath: z.string().min(1),
+    justification: z.string().min(1),
+  }),
+]);
+
+const approveSecretProposalSchema = z.object({
+  cascade: z.boolean().optional(),
+  overrides: z.object({
+    name: z.string().min(1).optional(),
+    description: z.string().optional().nullable(),
+    providerConfigId: z.string().uuid().optional().nullable(),
+  }).optional(),
+});
+
+const rejectSecretProposalSchema = z.object({ reason: z.string().min(1) });
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/me/secret-proposals",
+  tags: ["secrets"],
+  summary: "Propose a company secret or agent secret binding",
+  request: { body: jsonBody(createAgentSecretProposalSchema) },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/me/secret-proposals",
+  tags: ["secrets"],
+  summary: "List secret proposals visible to the current agent run",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/agents/me/secret-proposals/{id}",
+  tags: ["secrets"],
+  summary: "Withdraw a pending secret proposal",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
 registry.registerPath({
   method: "get",
   path: "/api/agents/me/secrets",
@@ -1858,7 +1975,7 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(agentSkillSyncSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, 422: r.unprocessable },
 });
 
 registry.registerPath({
@@ -2025,6 +2142,25 @@ registry.registerPath({
     body: jsonBody(updateIssueSchema.partial()),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/stalled-review-decision",
+  tags: ["issues"],
+  summary: "Resolve a stalled issue review",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(stalledReviewDecisionSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({
@@ -2741,6 +2877,42 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/secret-proposals",
+  tags: ["secrets"],
+  summary: "List company secret proposals for board review",
+  request: {
+    params: z.object({ companyId: z.string().uuid() }),
+    query: z.object({ status: z.enum(["pending", "approved", "rejected", "withdrawn", "expired"]).optional() }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/secret-proposals/{id}/approve",
+  tags: ["secrets"],
+  summary: "Approve and execute a secret proposal as the approving board user",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), id: z.string().uuid() }),
+    body: jsonBody(approveSecretProposalSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/secret-proposals/{id}/reject",
+  tags: ["secrets"],
+  summary: "Reject a pending secret proposal and dependent bindings",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), id: z.string().uuid() }),
+    body: jsonBody(rejectSecretProposalSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
   method: "patch",
   path: "/api/secrets/{id}",
   tags: ["secrets"],
@@ -3100,6 +3272,62 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/audit/agent-actions",
+  tags: ["activity"],
+  summary: "List agent action audit entries",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      responsibleUserId: z.string().min(1).optional(),
+      runId: z.string().uuid().optional(),
+      entityType: z.string().min(1).optional(),
+      entityId: z.string().min(1).optional(),
+      action: z.string().min(1).optional(),
+      actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
+      from: z.string().datetime().optional(),
+      to: z.string().datetime().optional(),
+      cursor: z.string().min(1).optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/audit/agent-actions.csv",
+  tags: ["activity"],
+  summary: "Export agent action audit entries as CSV",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      responsibleUserId: z.string().min(1).optional(),
+      runId: z.string().uuid().optional(),
+      entityType: z.string().min(1).optional(),
+      entityId: z.string().min(1).optional(),
+      action: z.string().min(1).optional(),
+      actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
+      from: z.string().datetime().optional(),
+      to: z.string().datetime().optional(),
+      cursor: z.string().min(1).optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }),
+  },
+  responses: {
+    200: {
+      description: "Agent action audit export",
+      content: { "text/csv": { schema: z.string() } },
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/activity",
   tags: ["activity"],
@@ -3188,8 +3416,353 @@ registry.registerPath({
   path: "/api/companies/{companyId}/attention",
   tags: ["inbox"],
   summary: "List decision-only attention feed items",
-  request: { params: z.object({ companyId: z.string() }) },
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      includeDismissed: z.enum(["true", "false"]).optional(),
+      archived: z.enum(["true", "false"]).optional(),
+      all: z.enum(["true", "false"]).optional(),
+      activitySince: z.string().datetime().optional(),
+      activityUntil: z.string().datetime().optional(),
+      queue: z.string().min(1).optional(),
+      sort: z.enum(["activity", "decide"]).optional(),
+      cursor: z.string().min(1).optional(),
+      limit: z.coerce.number().int().min(1).max(100).optional(),
+    }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+// ─── Decisions ──────────────────────────────────────────────────────────────
+
+// Decision queues and triage
+
+const decisionQueueSeedRuleSchema = z.object({
+  key: z.string(),
+  description: z.string(),
+  signal: z.enum([
+    "issue_has_pull_request_work_product",
+    "plan_document_confirmation",
+    "ask_user_questions",
+  ]),
+}).strict();
+
+const decisionQueueSchema = z.object({
+  id: z.string(),
+  companyId: z.string(),
+  key: z.string(),
+  title: z.string(),
+  description: z.string().nullable(),
+  createdByType: z.enum(["agent", "user", "system"]),
+  createdByAgentId: z.string().nullable(),
+  createdByUserId: z.string().nullable(),
+  createdByRunId: z.string().nullable(),
+  retentionDays: z.number().int().nullable(),
+  seedRules: z.array(decisionQueueSeedRuleSchema),
+  seedRulesEnabled: z.boolean(),
+  itemCount: z.number().int().nonnegative(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+const decisionQueueItemSchema = z.object({
+  id: z.string(),
+  companyId: z.string(),
+  queueId: z.string(),
+  sourceKind: decisionAttentionSourceKindSchema,
+  sourceId: z.string(),
+  addedByType: z.enum(["agent", "user", "system"]),
+  addedByAgentId: z.string().nullable(),
+  addedByUserId: z.string().nullable(),
+  addedByRunId: z.string().nullable(),
+  responsibleUserId: z.string().nullable(),
+  createdAt: z.string().datetime(),
+}).strict();
+
+const decisionTriageSchema = z.object({
+  id: z.string(),
+  companyId: z.string(),
+  sourceKind: decisionAttentionSourceKindSchema,
+  sourceId: z.string(),
+  decideBy: z.string().nullable(),
+  snoozedUntil: z.string().datetime().nullable(),
+  setByType: z.enum(["agent", "user"]),
+  setByAgentId: z.string().nullable(),
+  setByUserId: z.string().nullable(),
+  setByRunId: z.string().nullable(),
+  responsibleUserId: z.string().nullable(),
+  version: z.number().int().positive(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+const decisionRetentionSchema = z.object({
+  id: z.string(),
+  companyId: z.string(),
+  sourceKind: decisionAttentionSourceKindSchema,
+  sourceId: z.string(),
+  sourceActivityAt: z.string().datetime(),
+  keep: z.boolean(),
+  archivedAt: z.string().datetime().nullable(),
+  archivedReason: z.string().nullable(),
+  archivedByType: z.enum(["agent", "user", "system"]).nullable(),
+  archivedByAgentId: z.string().nullable(),
+  archivedByUserId: z.string().nullable(),
+  archivedByRunId: z.string().nullable(),
+  version: z.number().int().positive(),
+  archiveVersion: z.number().int().nonnegative(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/decision-queue-seed-rules",
+  tags: ["decision-queues"],
+  summary: "List built-in decision queue seed rules",
+  responses: { 200: r.ok(z.array(decisionQueueSeedRuleSchema)), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/decision-queues",
+  tags: ["decision-queues"],
+  summary: "List decision queues",
+  responses: { 200: r.ok(z.array(decisionQueueSchema)), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/decision-queues",
+  tags: ["decision-queues"],
+  summary: "Create a decision queue",
+  body: createDecisionQueueSchema,
+  responses: {
+    200: r.ok(decisionQueueSchema),
+    201: r.ok(decisionQueueSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/companies/{companyId}/decision-queues/{key}",
+  tags: ["decision-queues"],
+  summary: "Update a decision queue",
+  body: updateDecisionQueueSchema,
+  responses: {
+    200: r.ok(decisionQueueSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/decision-queues/{key}/items",
+  tags: ["decision-queues"],
+  summary: "List visible items in a decision queue",
+  responses: {
+    200: r.ok(z.array(decisionQueueItemSchema)),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/decision-queues/{key}/items",
+  tags: ["decision-queues"],
+  summary: "Add an item to a decision queue",
+  body: addDecisionQueueItemSchema,
+  responses: {
+    200: r.ok(decisionQueueItemSchema),
+    201: r.ok(decisionQueueItemSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/companies/{companyId}/decision-queues/{key}/items/{sourceKind}/{sourceId}",
+  tags: ["decision-queues"],
+  summary: "Remove an item from a decision queue",
+  body: removeDecisionQueueItemSchema,
+  responses: {
+    200: r.ok(decisionQueueItemSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/decision-triage/{sourceKind}/{sourceId}",
+  tags: ["decision-queues"],
+  summary: "Get decision triage for an attention source",
+  responses: {
+    200: r.ok(decisionTriageSchema.nullable()),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/companies/{companyId}/decision-triage/{sourceKind}/{sourceId}",
+  tags: ["decision-queues"],
+  summary: "Set decision triage for an attention source",
+  body: updateDecisionTriageSchema,
+  responses: {
+    200: r.ok(decisionTriageSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/companies/{companyId}/decision-retention/{sourceKind}/{sourceId}",
+  tags: ["decision-queues"],
+  summary: "Set Keep for an attention source",
+  body: updateDecisionRetentionSchema,
+  responses: { 200: r.ok(decisionRetentionSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+for (const action of ["archive", "revive"] as const) {
+  registerCurrentRoute({
+    method: "post",
+    path: `/api/companies/{companyId}/decision-retention/{sourceKind}/{sourceId}/${action}`,
+    tags: ["decision-queues"],
+    summary: action === "archive" ? "Archive an attention source" : "Revive an archived attention source",
+    responses: { 200: r.ok(decisionRetentionSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+  });
+}
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/decision-archive-proposals",
+  tags: ["decisions"],
+  summary: "Propose one signed bulk archive decision",
+  body: createDecisionArchiveProposalSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
+});
+
+// Decisions
+
+const createDecisionBodySchema = z.object({
+  title: z.string().trim().min(1).max(500),
+  body: z.string().max(100_000),
+  ruleKey: z.string().trim().max(240).nullable().optional(),
+  options: decisionOptionsSchema,
+  inputs: decisionInputsSchema.nullable().optional(),
+  expiresAt: z.string().datetime().optional(),
+  idempotencyKey: z.string().trim().min(1).max(500).nullable().optional(),
+  continuationPolicy: z.enum(["none", "wake_origin_agent"]).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+}).strict();
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/decisions",
+  tags: ["decisions"],
+  summary: "Propose a decision",
+  body: createDecisionBodySchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/decision-bundles",
+  tags: ["decisions"],
+  summary: "Propose a decision bundle",
+  body: z.object({
+    title: z.string().trim().min(1).max(500),
+    summary: z.string().max(100_000),
+    decisions: z.array(createDecisionBodySchema).min(1).max(50),
+  }).strict(),
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/decisions",
+  tags: ["decisions"],
+  summary: "List decisions",
+  query: z.object({
+    status: z.enum(["open", "decided", "expired", "cancelled"]).optional(),
+    bundleId: z.string().uuid().optional(),
+    targetIssueId: z.string().uuid().optional(),
+    originAgentId: z.string().uuid().optional(),
+    limit: z.coerce.number().int().positive().max(100).optional(),
+  }),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/decisions/stats",
+  tags: ["decisions"],
+  summary: "Get decision telemetry grouped by rule key",
+  query: z.object({
+    groupBy: z.literal("ruleKey"),
+    originAgentId: z.string().uuid().optional(),
+    since: z.string().datetime().optional(),
+  }),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/decisions/{id}",
+  tags: ["decisions"],
+  summary: "Get a decision outcome",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/decisions/{id}/decide",
+  tags: ["decisions"],
+  summary: "Resolve a decision",
+  body: z.object({
+    optionId: z.string().trim().min(1).max(120),
+    inputValues: z.record(z.string(), z.string().max(20_000)).optional(),
+    idempotencyKey: z.string().trim().min(1).max(500).nullable().optional(),
+  }).strict(),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/decisions/{id}/dismiss",
+  tags: ["decisions"],
+  summary: "Dismiss a decision",
+  body: z.object({ reason: z.string().max(20_000).nullable().optional() }).strict(),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/decisions/{id}/cancel",
+  tags: ["decisions"],
+  summary: "Cancel a decision",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 // ─── Decision training ──────────────────────────────────────────────────────
@@ -3912,6 +4485,18 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/withdraw",
+  tags: ["issues"],
+  summary: "Withdraw a pending issue thread interaction",
+  request: {
+    params: z.object({ id: z.string(), interactionId: z.string() }),
+    body: jsonBody(withdrawIssueThreadInteractionSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/issues/{id}/children",
   tags: ["issues"],
   summary: "Create child issues",
@@ -4292,6 +4877,18 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/companies/{companyId}/skills/browse-project",
+  tags: ["skills"],
+  summary: "Browse a project workspace for skills",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(companySkillProjectBrowseRequestSchema),
+  },
+  responses: { 200: r.ok(companySkillProjectBrowseResultSchema), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/companies/{companyId}/skills/scan-projects",
   tags: ["skills"],
   summary: "Scan project for skills",
@@ -4548,6 +5145,15 @@ registry.registerPath({
   path: "/api/environments/{id}/delete-blast-radius",
   tags: ["environments"],
   summary: "Get environment delete blast radius",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/environments/{id}/secret-refs",
+  tags: ["environments"],
+  summary: "Describe an environment's config secret refs (name, status, owning company — never values)",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
