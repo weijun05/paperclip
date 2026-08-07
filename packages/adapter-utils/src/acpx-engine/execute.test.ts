@@ -483,6 +483,44 @@ describe("shared ACPX engine runtime behavior", () => {
     });
   });
 
+  it("forwards the run-scoped Playwright socket directory into the MCP server config", async () => {
+    const { meta } = await runExecutor({
+      agent: "codex",
+      model: "gpt-runtime",
+      env: {
+        PWTEST_SOCKETS_DIR: "/tmp/pw-aet109",
+        CODEX_CONFIG: JSON.stringify({
+          approval_policy: "never",
+          mcp_servers: {
+            playwright: {
+              enabled: true,
+              env: {
+                KEEP: "existing",
+                PWTEST_SOCKETS_DIR: "/tmp/stale",
+              },
+            },
+            other: { url: "https://mcp.example.test" },
+          },
+        }),
+      },
+    });
+
+    expect(JSON.parse(String((meta[0]?.env as Record<string, string>).CODEX_CONFIG))).toEqual({
+      model: "gpt-runtime",
+      approval_policy: "never",
+      mcp_servers: {
+        playwright: {
+          enabled: true,
+          env: {
+            KEEP: "existing",
+            PWTEST_SOCKETS_DIR: "/tmp/pw-aet109",
+          },
+        },
+        other: { url: "https://mcp.example.test" },
+      },
+    });
+  });
+
   it("warns when runtime settings replace malformed user CODEX_CONFIG", async () => {
     const { logs, meta } = await runExecutor({
       agent: "codex",
