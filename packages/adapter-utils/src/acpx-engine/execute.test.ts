@@ -1383,6 +1383,48 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(payloadEnv.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");
   });
 
+  it("threads a sanitized host base and current run env into the remote process-session runtime", async () => {
+    const root = await makeTempRoot();
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    const previousSigner = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-host-signer";
+
+    try {
+      const { runtimeOptions, sessionInputs } = await runExecutor(
+        { agent: "custom", agentCommand: "node ./fake-acp.js", cwd: localCwd, stateDir: path.join(root, "state") },
+        {
+          authToken: "synthetic-run-api-key",
+          executionTarget: {
+            kind: "remote",
+            transport: "sandbox",
+            providerKey: "fake-plugin",
+            remoteCwd,
+            runner: createLocalSandboxRunner(),
+          },
+        },
+      );
+
+      const spawnEnv = runtimeOptions[0]!.spawnEnv as Record<string, string>;
+      expect(spawnEnv.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      // Run-scoped credentials stay out of reusable runtime options.
+      expect(spawnEnv.PAPERCLIP_API_KEY).toBeUndefined();
+
+      const sessionEnv = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+      expect(sessionEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+      // The remote lane replaces the host run token with a scoped callback-
+      // bridge credential before it reaches the process session.
+      expect(sessionEnv.PAPERCLIP_API_KEY).toBeTruthy();
+      expect(sessionEnv.PAPERCLIP_API_KEY).not.toBe("synthetic-run-api-key");
+      expect(sessionEnv.PAPERCLIP_RUN_ID).toBe("run-1");
+    } finally {
+      if (previousSigner === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousSigner;
+    }
+  });
+
   it("keeps the session fingerprint stable when only the host spawn cwd changes", async () => {
     // `spawnCwd` (the host-only spawn redirect = the host `cwd`) must NOT enter
     // the session fingerprint or compat key: two runs of the same session that

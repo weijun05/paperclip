@@ -14,36 +14,55 @@ afterEach(async () => {
   await Promise.all(tempRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
-it("spawns a real Node ACP agent with per-session env on this platform", async () => {
+it("isolates inherited Paperclip secrets at the real local ACP child spawn", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acpx-spawn-smoke-"));
   tempRoots.push(root);
   const stateDir = path.join(root, "state");
+  const envReportPath = path.join(root, "child-env-report.json");
   const logs: string[] = [];
   const execute = createAcpxEngineExecutor();
+  const previousSigner = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-host-signer";
 
-  const result = await execute({
-    runId: "spawn-smoke",
-    agent: { id: "spawn-agent", companyId: "spawn-company" },
-    runtime: {},
-    config: {
-      agent: "custom",
-      agentCommand: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} ${JSON.stringify(fixturePath.replaceAll("\\", "/"))}`,
-      mode: "oneshot",
-      stateDir,
-      cwd: repoRoot,
-      env: { PAPERCLIP_ACPX_SPAWN_SMOKE: "spawn-ok" },
-    },
-    context: {},
-    onLog: async (_stream: string, text: string) => logs.push(text),
-    onMeta: async () => {},
-  } as never);
+  try {
+    const result = await execute({
+      runId: "spawn-smoke",
+      agent: { id: "spawn-agent", companyId: "spawn-company" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} ${JSON.stringify(fixturePath.replaceAll("\\", "/"))}`,
+        mode: "oneshot",
+        stateDir,
+        cwd: repoRoot,
+        env: {
+          ACPX_ENV_REPORT_PATH: envReportPath,
+          PAPERCLIP_ACPX_SPAWN_SMOKE: "spawn-ok",
+        },
+      },
+      context: {},
+      authToken: "synthetic-run-api-key",
+      onLog: async (_stream: string, text: string) => logs.push(text),
+      onMeta: async () => {},
+    } as never);
 
-  expect(result.exitCode, JSON.stringify({ result, logs }, null, 2)).toBe(0);
-  expect(logs.join(""), logs.join("\n")).toContain("spawn-ok");
-  await expect(fs.access(path.join(stateDir, "wrappers"))).rejects.toThrow();
-  const stderr = await fs.readFile(path.join(stateDir, "run-stderr", "spawn-smoke.log"), "utf8");
-  expect(stderr).toContain("nes/close");
-  expect(stderr).toContain("paperclip-acp-echo-agent started");
+    expect(result.exitCode, JSON.stringify({ result, logs }, null, 2)).toBe(0);
+    expect(logs.join(""), logs.join("\n")).toContain("spawn-ok");
+    expect(JSON.parse(await fs.readFile(envReportPath, "utf8"))).toEqual({
+      signerPresentAtChild: false,
+      agentIdPresentAtChild: true,
+      apiKeyPresentAtChild: true,
+      runIdPresentAtChild: true,
+      configuredMarkerPresentAtChild: true,
+    });
+    await expect(fs.access(path.join(stateDir, "wrappers"))).rejects.toThrow();
+    const stderr = await fs.readFile(path.join(stateDir, "run-stderr", "spawn-smoke.log"), "utf8");
+    expect(stderr).toContain("nes/close");
+    expect(stderr).toContain("paperclip-acp-echo-agent started");
+  } finally {
+    if (previousSigner === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousSigner;
+  }
 });
 
 it("captures the Node error shape for a host-invalid spawn cwd", async () => {

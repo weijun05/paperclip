@@ -75,6 +75,28 @@ describe("acpx identity split and launch environment", () => {
     void _assertBrand;
   });
 
+  it("strips inherited Paperclip secrets while preserving run-scoped env", () => {
+    const previousSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "host-only-signer-secret";
+
+    try {
+      const launchEnvironment = finalizeLaunchEnvironment({
+        PAPERCLIP_AGENT_ID: "agent-id",
+        PAPERCLIP_API_KEY: "run-scoped-api-key",
+      }, []);
+
+      expect(launchEnvironment.env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      expect(launchEnvironment.env.PAPERCLIP_AGENT_ID).toBe("agent-id");
+      expect(launchEnvironment.env.PAPERCLIP_API_KEY).toBe("run-scoped-api-key");
+    } finally {
+      if (previousSecret === undefined) {
+        delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      } else {
+        process.env.PAPERCLIP_AGENT_JWT_SECRET = previousSecret;
+      }
+    }
+  });
+
   it("test_run_scoped_contribution_is_not_assignable_to_a_reuse_payload", () => {
     // A run-scoped contribution and the branded launch environment must never
     // enter a reuse payload (Amendment B). The reuse candidate types reject both.

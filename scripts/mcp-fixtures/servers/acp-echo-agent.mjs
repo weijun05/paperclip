@@ -1,9 +1,21 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 function writeMessage(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+const envReportPath = process.env.ACPX_ENV_REPORT_PATH;
+if (envReportPath) {
+  writeFileSync(envReportPath, JSON.stringify({
+    signerPresentAtChild: Object.hasOwn(process.env, "PAPERCLIP_AGENT_JWT_SECRET"),
+    agentIdPresentAtChild: Boolean(process.env.PAPERCLIP_AGENT_ID),
+    apiKeyPresentAtChild: Boolean(process.env.PAPERCLIP_API_KEY),
+    runIdPresentAtChild: Boolean(process.env.PAPERCLIP_RUN_ID),
+    configuredMarkerPresentAtChild: Boolean(process.env.PAPERCLIP_ACPX_SPAWN_SMOKE),
+  }));
 }
 
 async function handleRequest(request) {

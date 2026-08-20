@@ -40,6 +40,7 @@ import {
   buildPaperclipEnv,
   ensureAbsoluteDirectory,
   ensurePathInEnv,
+  sanitizeInheritedPaperclipEnv,
   ensurePaperclipSkillSymlink,
   isForbiddenConfigEnvKey,
   isPaperclipRuntimeEnvKey,
@@ -169,6 +170,9 @@ function flushChildStderr(state: ChildStderrState) {
 
 type PaperclipAcpRuntimeOptions = AcpRuntimeOptions & {
   onAgentSpawn?: (meta: AcpxAgentProcessIdentity) => Promise<void>;
+  // ACPX uses this as the inherited base for the real child spawn, then applies
+  // the current session's env. Keep run-scoped credentials in sessionOptions.
+  spawnEnv?: NodeJS.ProcessEnv;
   // Return the current-run parent-context token. It is the `task.run` token
   // during startup and after the turn, and the `agent.turn` token during the
   // turn. A detached exec reads this getter to parent to the live run span. The
@@ -2282,14 +2286,14 @@ async function applySessionConfigOptions(input: {
 }
 
 /**
- * Build the process-session launch env: the host env overlaid with the run's
- * `env` (so the merged paperclip bridge vars win) and a guaranteed `PATH`,
- * narrowed to string values. Shared by the remote concurrent bring-up and the
- * local / runner-less lane so both resolve the runtime env identically.
+ * Build the process-session launch env: the sanitized host env overlaid with
+ * the run's `env` (so the merged paperclip bridge vars win) and a guaranteed
+ * `PATH`, narrowed to string values. Shared by the remote concurrent bring-up
+ * and the local / runner-less lane so both resolve the runtime env identically.
  */
 function resolveRuntimeEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+    Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -3503,6 +3507,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // fingerprint / compat key are unaffected — this redirects ONLY the host
           // `spawn()` `chdir`, not the in-sandbox data path.
           spawnCwd: prepared.hostSpawnCwd,
+          // ACPX normally inherits the server's raw process.env at its final
+          // child-spawn boundary. Give it an explicit sanitized base instead;
+          // the current run's env is still overlaid below through ensureSession.
+          // Keeping those run-scoped values out of runtimeOptions also prevents
+          // a warm runtime from retaining an expired run credential.
+          spawnEnv: resolveRuntimeEnv({}),
           sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
           agentRegistry: prepared.agentRegistry,
           permissionMode: prepared.permissionMode,

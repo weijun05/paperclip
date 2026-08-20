@@ -32,11 +32,13 @@ const repoRoot = fileURLToPath(new URL("../../../..", import.meta.url));
 // the host actually spawned it in (`SPAWN_CWD`) and the `cwd` advertised on
 // `session/new` (`SESSION_NEW_CWD`).
 const fixturePath = path.join(repoRoot, "scripts", "mcp-fixtures", "servers", "acp-cwd-report-agent.mjs");
+const envFixturePath = path.join(repoRoot, "scripts", "mcp-fixtures", "servers", "acp-echo-agent.mjs");
 const tempRoots: string[] = [];
 
 type PatchedAcpRuntimeOptions = AcpRuntimeOptions & {
   onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
   spawnCwd?: string;
+  spawnEnv?: NodeJS.ProcessEnv;
 };
 
 type PatchedEnsureSessionOptions = Parameters<ReturnType<typeof createAcpRuntime>["ensureSession"]>[0];
@@ -59,17 +61,22 @@ async function makeTempDir(prefix: string): Promise<string> {
  */
 async function ensureRealAcpSession(input: {
   cwd: string;
+  fixturePath?: string;
   spawnCwd?: string;
+  spawnEnv?: NodeJS.ProcessEnv;
+  sessionEnv?: Record<string, string>;
   onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
 }) {
   const stateRoot = await makeTempDir("paperclip-acpx-remote-spawn-state-");
   const stderrChunks: string[] = [];
-  const agentCommand = `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} ${JSON.stringify(fixturePath.replaceAll("\\", "/"))}`;
+  const selectedFixturePath = input.fixturePath ?? fixturePath;
+  const agentCommand = `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} ${JSON.stringify(selectedFixturePath.replaceAll("\\", "/"))}`;
   const runtimeOptions: PatchedAcpRuntimeOptions = {
     cwd: input.cwd,
     // `spawnCwd` is the host-only knob added by patches/acpx@0.12.0.patch; when
     // unset acpx falls back to `cwd`, so every non-proxy lane is byte-identical.
     ...(input.spawnCwd ? { spawnCwd: input.spawnCwd } : {}),
+    ...(input.spawnEnv ? { spawnEnv: input.spawnEnv } : {}),
     sessionStore: createRuntimeStore({ stateDir: path.join(stateRoot, "state") }),
     agentRegistry: createAgentRegistry({ overrides: { custom: agentCommand } }),
     permissionMode: "approve-all",
@@ -85,7 +92,7 @@ async function ensureRealAcpSession(input: {
       agent: "custom",
       mode: "oneshot",
       cwd: input.cwd,
-      sessionOptions: { env: {} },
+      sessionOptions: { env: input.sessionEnv ?? {} },
     };
     const handle = await runtime.ensureSession(sessionInput);
     await (runtime as { close: (i: unknown) => Promise<void> }).close({ handle, reason: "done" }).catch(() => {});
@@ -146,6 +153,45 @@ it("spawnCwd redirects the host spawn to a host-valid dir while the advertised s
   // ...while the in-sandbox data path (the advertised `session/new` cwd) is
   // unchanged — still `remoteCwd`.
   expect(outcome.stderr).toContain(`SESSION_NEW_CWD=${remoteCwd}`);
+});
+
+it("uses the explicit sanitized env at the real remote proxy spawn boundary", async () => {
+  const sandboxParent = await makeTempDir("paperclip-acpx-remote-spawn-sandbox-");
+  const remoteCwd = path.join(sandboxParent, "does-not-exist-on-host", "workspace");
+  const hostSpawnCwd = await makeTempDir("paperclip-acpx-remote-spawn-host-");
+  const envReportPath = path.join(hostSpawnCwd, "child-env-report.json");
+  const previousSigner = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-host-signer";
+
+  try {
+    const outcome = await ensureRealAcpSession({
+      cwd: remoteCwd,
+      fixturePath: envFixturePath,
+      spawnCwd: hostSpawnCwd,
+      spawnEnv: {
+        ACPX_ENV_REPORT_PATH: envReportPath,
+        PATH: process.env.PATH,
+      },
+      sessionEnv: {
+        PAPERCLIP_AGENT_ID: "synthetic-agent",
+        PAPERCLIP_API_KEY: "synthetic-run-api-key",
+        PAPERCLIP_RUN_ID: "synthetic-run",
+        PAPERCLIP_ACPX_SPAWN_SMOKE: "spawn-ok",
+      },
+    });
+
+    expect(outcome.resolved, JSON.stringify(outcome)).toBe(true);
+    expect(JSON.parse(await fs.readFile(envReportPath, "utf8"))).toEqual({
+      signerPresentAtChild: false,
+      agentIdPresentAtChild: true,
+      apiKeyPresentAtChild: true,
+      runIdPresentAtChild: true,
+      configuredMarkerPresentAtChild: true,
+    });
+  } finally {
+    if (previousSigner === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousSigner;
+  }
 });
 
 it("kills the ACP agent when process identity persistence rejects", async () => {
