@@ -25,6 +25,7 @@ COPY packages/google-sheets-mcp-server/package.json packages/google-sheets-mcp-s
 COPY packages/kv-demo-mcp-server/package.json packages/kv-demo-mcp-server/
 COPY packages/mcp-server/package.json packages/mcp-server/
 COPY packages/skills-catalog/package.json packages/skills-catalog/
+COPY packages/tailscale-https-broker/package.json packages/tailscale-https-broker/
 COPY packages/teams-catalog/package.json packages/teams-catalog/
 COPY packages/adapters/claude-local/package.json packages/adapters/claude-local/
 COPY packages/adapters/codex-local/package.json packages/adapters/codex-local/
@@ -53,6 +54,14 @@ COPY --from=deps /app /app
 COPY . .
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
+# The server build runs scripts/write-build-stamp.mjs, which stamps the built
+# commit into dist/build-info.json. The build context has no .git, so the
+# script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the
+# next RUN as an environment variable, so declare it here — in the build
+# stage — before the server build. The production stage below declares the
+# same ARG again for the runtime fallback; an ARG goes out of scope at the
+# end of its stage. Empty for local `docker build`, which then writes no stamp.
+ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 

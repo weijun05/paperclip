@@ -48,8 +48,8 @@ import {
 } from "../issue-execution-policy.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-  buildIssueBlockersResolvedWakeIdempotencyKey,
-  findExistingIssueBlockersResolvedWakeForAnyKey,
+  buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
@@ -58,9 +58,16 @@ import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
+  isPluginManagedIssueLifecycle,
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
+import {
+  buildExecutionReviewParticipantRecoveryNoticeSeed,
+  buildExecutionReviewParticipantUnavailableNoticeSeed,
+  buildStrandedRecoveryEscalationNotice,
+  type StrandedRecoveryNoticeSeed,
+} from "./stranded-notice.js";
 import {
   RECOVERY_ORIGIN_KINDS,
   buildIssueGraphLivenessLeafKey,
@@ -322,25 +329,6 @@ function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   return null;
 }
 
-function buildExecutionReviewParticipantRecoveryComment(latestRun: LatestIssueRun) {
-  const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-  return (
-    "Paperclip retried the pending execution-review participant once, but the review stage still has no completed decision " +
-    `or live reviewer run.${failureSummary ?? ""} ` +
-    "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
-    "restore the review stage, or record an intentional manual resolution."
-  );
-}
-
-function buildExecutionReviewParticipantUnavailableComment(latestRun: LatestIssueRun) {
-  const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-  return (
-    "Paperclip cannot continue the pending execution-review participant because the participant is not invokable " +
-    `and the review stage has no completed decision or live reviewer run.${failureSummary ?? ""} ` +
-    "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
-    "restore the review stage, or record an intentional manual resolution."
-  );
-}
 
 function didAutomaticRecoveryFail(
   latestRun: LatestIssueRun,
@@ -3325,6 +3313,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
     comment?: string;
+    notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
@@ -3366,17 +3355,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
 
-    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
     const recoveryOwner = recoveryAction.ownerAgentId ? await getAgent(recoveryAction.ownerAgentId) : null;
     const sourceAssignee = input.issue.assigneeAgentId ? await getAgent(input.issue.assigneeAgentId) : null;
     let notice: SuccessfulRunHandoffNotice | null = null;
     if (input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
+      const [sourceRun] = input.successfulRunHandoffEvidence.sourceRunId
+        ? await db
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            agentId: heartbeatRuns.agentId,
+          })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, input.successfulRunHandoffEvidence.sourceRunId),
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+          ))
+          .limit(1)
+        : [];
       notice = buildSuccessfulRunHandoffExhaustedNotice({
         issue: input.issue,
-        sourceRun: input.successfulRunHandoffEvidence.sourceRunId
-          ? { id: input.successfulRunHandoffEvidence.sourceRunId, status: "succeeded" }
+        sourceRun: sourceRun ?? null,
+        correctiveRun: input.latestRun
+          ? { id: input.latestRun.id, status: input.latestRun.status, agentId: input.latestRun.agentId }
           : null,
-        correctiveRun: input.latestRun ? { id: input.latestRun.id, status: input.latestRun.status } : null,
         sourceAssignee,
         recoveryIssue: null,
         recoveryActionId: recoveryAction.id,
@@ -3386,19 +3388,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
-    const recoveryLine = recoveryAction.ownerAgentId
-      ? [
-        "",
-        `- Recovery action: \`${recoveryAction.id}\``,
-        `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
-        "- Next action: the recovery owner should either restore a live execution path or record the manual resolution on the source issue.",
-      ].join("\n")
-      : [
-        "",
-        `- Recovery action: \`${recoveryAction.id}\``,
-        "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
-        "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
-      ].join("\n");
+    const escalationNotice = buildStrandedRecoveryEscalationNotice({
+      seed: input.notice,
+      fallbackBody: input.comment,
+      recoveryCause,
+      recoveryActionId: recoveryAction.id,
+      recoveryOwner: recoveryAction.ownerAgentId && recoveryOwner
+        ? { id: recoveryOwner.id, name: recoveryOwner.name }
+        : null,
+      sourceRun: input.latestRun
+        ? {
+            id: input.latestRun.id,
+            agentId: input.latestRun.agentId,
+            status: input.latestRun.status,
+            errorCode: input.latestRun.errorCode,
+            errorSummary: input.latestRun.error ? redactSensitiveText(input.latestRun.error) : null,
+          }
+        : null,
+    });
 
     const shouldPostEscalationComment =
       recoveryAction.attemptCount === 1 ||
@@ -3431,19 +3438,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             metadata: notice.metadata,
           });
         } else {
-          await issuesSvc.addComment(input.issue.id, `${input.comment ?? ""}${recoveryLine}`, {}, {
+          await issuesSvc.addComment(input.issue.id, escalationNotice.body, {}, {
             authorType: "system",
-            presentation: compactRecoveryPresentation(
-              `Recovery: ${recoveryCauseTitle(recoveryCause)} — moved to blocked ` +
-              `(owner: ${recoveryOwner?.name ?? "board"})`,
-            ),
-            metadata: recoveryNoticeMetadata({
-              cause: recoveryCause,
-              latestRun: input.latestRun,
-              recoveryActionId: recoveryAction.id,
-              previousStatus: input.previousStatus,
-              recoveryOwner,
-            }),
+            presentation: escalationNotice.presentation,
+            metadata: escalationNotice.metadata,
           });
         }
       }
@@ -3917,7 +3915,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               issue,
               previousStatus: "in_review",
               latestRun: participantLatestRun,
-              comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
+              notice: buildExecutionReviewParticipantUnavailableNoticeSeed(),
               recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
               recoveryOwnerAgentId: participantAgentId,
             });
@@ -3984,7 +3982,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
-            comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
+            notice: buildExecutionReviewParticipantUnavailableNoticeSeed(),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
           });
@@ -4002,7 +4000,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
-            comment: buildExecutionReviewParticipantRecoveryComment(participantLatestRun),
+            notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
           });
@@ -4079,15 +4077,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
-          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "todo",
             latestRun,
-            comment:
-              "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
-              `but it still has no live execution path.${failureSummary ?? ""} ` +
-              "Moving it to `blocked` so it is visible for intervention.",
+            notice: {
+              body:
+                "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
+                "but it still has no live execution path. " +
+                "Moving it to `blocked` so it is visible for intervention.",
+              title: "No live execution path",
+              tone: "danger",
+            },
           });
           if (updated) {
             result.escalated += 1;
@@ -4126,6 +4127,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
+        if (isPluginManagedIssueLifecycle(issue)) {
+          result.skipped += 1;
+          continue;
+        }
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
           continue;
@@ -4220,15 +4225,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (classification.kind === "non_retryable") {
-          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_progress",
             latestRun,
-            comment:
-              "Paperclip detected a non-retryable failure on this issue's continuation run " +
-              `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
-              `so it is visible for intervention.${failureSummary ?? ""}`,
+            notice: {
+              body:
+                "Paperclip detected a non-retryable failure on this issue's continuation run " +
+                `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
+                "so it is visible for intervention.",
+              title: "Continuation failed",
+              tone: "danger",
+            },
           });
           if (updated) {
             result.escalated += 1;
@@ -4247,19 +4255,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             classification.errorCode,
           );
           if (consecutive >= classification.maxAttempts) {
-            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
             const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
-            const causeCopy = classification.errorCode
-              ? ` Latest cause: \`${classification.errorCode}\`.`
-              : "";
             const updated = await escalateStrandedAssignedIssue({
               issue,
               previousStatus: "in_progress",
               latestRun,
-              comment:
-                "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-                `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
-                "Moving it to `blocked` so it is visible for intervention.",
+              notice: {
+                body:
+                  "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
+                  `execution disappeared, but it still has no live execution path${attemptCopy}. ` +
+                  "Moving it to `blocked` so it is visible for intervention.",
+                title: "No live execution path",
+                tone: "danger",
+              },
             });
             if (updated) {
               result.escalated += 1;
@@ -5250,19 +5258,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        const idempotencyKeys = readiness.blockerIssueIds.map((blockerIssueId) =>
-          buildIssueBlockersResolvedWakeIdempotencyKey({
-            dependentIssueId: candidate.id,
-            resolvedBlockerIssueId: blockerIssueId,
-          })
-        );
-        const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        // Level-triggered dedup: key on the full blocker set (the current ready
+        // state), not on any single resolved edge. An older completed per-edge
+        // wake for an earlier partial resolution has a different key, so it does
+        // not suppress this wake. The shared helper still suppresses a duplicate
+        // wake for the SAME ready state, which bounds reconciliation.
+        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: candidate.id,
-          resolvedBlockerIssueId,
+          blockerIssueIds: readiness.blockerIssueIds,
         });
-        const existingWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
+        const existingWake = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
           companyId,
-          idempotencyKeys,
+          dependentIssueId: candidate.id,
+          blockerIssueIds: readiness.blockerIssueIds,
         });
         if (existingWake) {
           result.existingWakeSkipped += 1;

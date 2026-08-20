@@ -439,10 +439,10 @@ interface IssueChatThreadProps {
   linkedRuns?: IssueChatLinkedRun[];
   timelineEvents?: IssueTimelineEvent[];
   /**
-   * Work-mode switch history from the activity feed. Only the redesigned
-   * TaskChatThread consumes this (flag: enableTaskChatRedesign) to tag each
-   * agent reply with the mode its request ran under; the legacy thread
-   * ignores it.
+   * Work-mode switch history from the activity feed. Only the chat-style
+   * TaskChatThread consumes this to tag each agent reply with the mode its
+   * request ran under; this thread — the classic task view behind
+   * enableClassicTaskInterface — ignores it.
    */
   workModeChanges?: IssueWorkModeChange[];
   liveRuns?: LiveRunForIssue[];
@@ -513,16 +513,15 @@ interface IssueChatThreadProps {
   footer?: ReactNode;
   /**
    * Issue header content (title row, badges, plugin toolbars) rendered INSIDE
-   * the thread's scroll viewport so it scrolls away with the messages. Only the
-   * redesigned TaskChatThread consumes this (flag: enableTaskChatRedesign);
-   * the legacy thread ignores it — its header stays in the page flow.
+   * the thread's scroll viewport so it scrolls away with the messages. Only
+   * the chat-style TaskChatThread consumes this; this thread ignores it — its
+   * header stays in the page flow.
    */
   threadHeader?: ReactNode;
   /**
    * The task description rendered as the requester's first chat bubble
-   * (PAP-375). Only the redesigned TaskChatThread consumes it (flag:
-   * enableTaskChatRedesign); the legacy thread ignores it — its description
-   * stays in the page header via InlineEditor.
+   * (PAP-375). Only the chat-style TaskChatThread consumes it; this thread
+   * ignores it — its description stays in the page header via InlineEditor.
    */
   issueBrief?: TaskChatIssueBrief;
   variant?: "full" | "embedded";
@@ -2223,7 +2222,7 @@ function IssueChatFeedbackButtons({
               <span className="font-medium text-foreground">Don't allow</span> to keep this vote
               and future votes local.
             </p>
-            <p>You can change this later in Instance Settings &gt; General.</p>
+            <p>You can change this later in Settings &gt; General.</p>
             {termsUrl ? (
               <a
                 href={termsUrl}
@@ -2930,7 +2929,11 @@ function IssueChatSystemMessage({ message }: { message: ThreadMessage }) {
   }
 
   if (custom.kind === "interaction" && interaction) {
-    if (interaction.kind === "request_confirmation" && interaction.status === "expired") {
+    if (
+      interaction.kind === "request_confirmation"
+      && interaction.status === "expired"
+      && !interaction.payload.secretProposal
+    ) {
       return (
         <ExpiredRequestConfirmationActivity
           message={message}
